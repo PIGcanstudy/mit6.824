@@ -37,7 +37,7 @@ func ihash(key string) int {
 // 把中间结果保存到了磁盘中,存入中间结果的名为task_id.txt
 func saveTaskToLocal(x int, y int, kva []KeyValue) string {
 
-	log.Println("saveTaskToLocal Start")
+	//log.Println("saveTaskToLocal Start")
 
 	dir, _ := os.Getwd() // 获取当前的文件目录路径
 
@@ -119,7 +119,7 @@ func Worker(mapf func(string, string) []KeyValue,
 
 func reducer(task *Task, reducef func(string, []string) string) {
 
-	log.Println("reducer start: Id is ", task.Id)
+	//log.Println("reducer start: Id is ", task.Id)
 
 	// 读取中间结果文件
 	kva := *readFromLocalFile(task.MiddleData)
@@ -135,7 +135,7 @@ func reducer(task *Task, reducef func(string, []string) string) {
 	}
 
 	// 将有相同key的合并成一个
-	for i := 0; i < len(kva)-1; i++ {
+	for i := 0; i < len(kva); i++ {
 		j := i + 1
 		for j < len(kva) && kva[i].Key == kva[j].Key {
 			j++
@@ -160,22 +160,16 @@ func reducer(task *Task, reducef func(string, []string) string) {
 	oname := fmt.Sprintf("mr-out-%d", task.Id)
 	os.Rename(tmpfile.Name(), oname)
 
-	task.Output = filepath.Join(dir, oname) // 记录输出文件的路径
+	task.Output = oname // 记录输出文件的路径
 
-	log.Println("reducer end: Id is ", task.Id)
+	//log.Println("reducer end: Id is ", task.Id)
 
-	ReducenotifyDone(task)
-}
-
-// 通知协调器任务完成所作的操作（告知协调器中间结果文件路径）
-func ReducenotifyDone(Task *Task) {
-	reply := NullReply{}
-	call("Coordinator.ReduceTaskComplated", Task, &reply) // 调用协调器的ComplateTask函数，通知任务完成
+	NotifyTaskDone(task)
 }
 
 func mapper(task *Task, mapf func(string, string) []KeyValue) {
 
-	log.Println("开始执行mapper")
+	//log.Println("开始执行mapper")
 
 	taskName := strconv.Itoa(task.Id)
 	// 调用map函数处理任务
@@ -190,7 +184,7 @@ func mapper(task *Task, mapf func(string, string) []KeyValue) {
 
 	buffer := make([][]KeyValue, task.NReduce) // 定义存放分成nReduce份的中间结果的buffer
 
-	log.Println("task.NReduce: ", task.NReduce)
+	//log.Println("task.NReduce: ", task.NReduce)
 
 	for _, kv := range kva {
 		idx := ihash(kv.Key) % task.NReduce
@@ -205,12 +199,14 @@ func mapper(task *Task, mapf func(string, string) []KeyValue) {
 	task.MiddleData = append(task.MiddleData, AddrOutPut...) // 将中间结果文件路径添加到task.MiddleData中
 
 	// 通知协调器任务完成所作的操作（告知协调器中间结果文件路径）
-	mapnotifyDone(task)
+	NotifyTaskDone(task)
 }
 
-func mapnotifyDone(task *Task) {
+func NotifyTaskDone(task *Task) {
+	// 通知协调器任务完成
+	args := task
 	reply := NullReply{}
-	call("Coordinator.MapTaskComplated", task, &reply) // 调用协调器的ComplateTask函数，通知任务完成
+	call("Coordinator.TaskCompleted", args, &reply)
 }
 
 // 可以有两种实现方式，一种是让协调器为单例模式，然后获取协调器单例，并从单例中的任务管道获取数据（此方法在多进程不适用）
@@ -224,7 +220,7 @@ func getTask() Task {
 	// 发送RPC请求并等待响应
 	call("Coordinator.AssignTask", &args, &reply)
 
-	log.Printf("获取到了的任务是：%v\n", reply)
+	//log.Printf("获取到了的任务是：%v\n", reply)
 
 	return reply
 }
@@ -259,6 +255,7 @@ func call(rpcname string, args interface{}, reply interface{}) bool {
 	c, err := rpc.DialHTTP("unix", sockname)
 	if err != nil {
 		log.Fatal("dialing:", err)
+		os.Exit(1)
 	}
 	defer c.Close()
 

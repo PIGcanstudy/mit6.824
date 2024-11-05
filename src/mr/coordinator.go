@@ -10,6 +10,7 @@ import (
 	"net/rpc"
 	"os"
 	"sync"
+	"time"
 )
 
 const minSplitSize = 16 * 1024 * 1024 // 16MB
@@ -30,11 +31,9 @@ func max(a, b int) int {
 type TaskStatus int
 
 const (
-	TaskPending TaskStatus = iota // 任务等待处理
-	ReduceTaskInProgress
-	ReduceTaskDone
-	MapTaskInProgress // Map任务正在进行中
-	MapTaskDone       // Map任务已经完成
+	TaskPending    TaskStatus = iota // 任务等待处理
+	TaskInProgress                   // 任务正在处理
+	Completed                        // 任务处理完成
 )
 
 type TaskType int
@@ -42,33 +41,30 @@ type TaskType int
 const (
 	Map    TaskType = iota // Map任务
 	Reduce                 // Reduce任务
-	Wait                   // 通知Worker等待任务
+	Wait                   // 等待任务
 	Exit                   // 通知Worker退出
-	Active                 // 运行状态
 )
 
 type Task struct {
-	Id         int        // 用来标识一个任务
-	NReduce    int        // 用来存储Reduce任务的个数 （由于运行在不同进程使用全局变量行不通了，当然也可以使用PRC来传递此信息）
-	Input      string     // 输入分割后的内容
-	Tasktype   TaskType   // 用来存储任务的类型
-	Taskstatus TaskStatus // 用来存储任务的状态
-	MiddleData []string   // 用来存储中间结果被存放在哪个文件的路径
-	Output     string     // 处理后输出的结果
+	Id            int        // 用来标识一个任务
+	NReduce       int        // 用来存储Reduce任务的个数 （由于运行在不同进程使用全局变量行不通了，当然也可以使用PRC来传递此信息）
+	Input         string     // 输入分割后的内容
+	Tasktype      TaskType   // 用来存储任务的类型
+	Taskstatus    TaskStatus // 用来存储任务的状态
+	TaskStartTime time.Time  // 任务开始时间(用于看是否超时)
+	MiddleData    []string   // 用来存储中间结果被存放在哪个文件的路径
+	Output        string     // 处理后输出的结果
 }
 
 type Coordinator struct {
 	// Your definitions here.
-	NReduce  int              // 用来存储Reduce任务的个数
-	nMap     int              // 用来存储Map任务的个数
-	WorkerId int              // 用来存储Worker的个数（用来唯一表示一个Worker）
-	Workers  map[int]struct{} // 用来存储活跃的Worker
-	Status   TaskType         // 用来存储Coordinator的阶段
-	Tasks    map[int]Task     // 用来存储任务的数组
-	nTask    int              // 用来存储任务的个数
+	NReduce       int           // 用来存储Reduce任务的个数
+	Status        TaskType      // 用来存储Coordinator的阶段
+	Tasks         map[int]*Task // 用来存储任务的数组
+	nTask         int           // 用来存储任务的个数
+	Intermediates [][]string    // Map任务产生的R个中间文件的信息
 
-	heartBeatChannel chan bool // 用来给Worker发送心跳包
-	TasksQueue       chan Task // 用来给Worker发送任务
+	TasksQueue chan Task // 用来给Worker发送任务
 }
 
 // Your code here -- RPC handlers for the worker to call.
@@ -91,11 +87,16 @@ func (c *Coordinator) AssignTask(args *NullArgs, reply *Task) error {
 	Mu.Lock()
 	defer Mu.Unlock()
 
-	log.Println("AssignTask called, len(TasksQueue):", len(c.TasksQueue))
+	//log.Println("AssignTask called, len(TasksQueue):", len(c.TasksQueue))
 
 	if len(c.TasksQueue) > 0 {
 		// 任务队列不为空，取出一个任务
 		*reply = <-c.TasksQueue
+		// 记录此次任务的开始时间
+		reply.TaskStartTime = time.Now()
+		reply.Taskstatus = TaskInProgress // 任务状态改为TaskInProgress
+		c.Tasks[reply.Id] = reply         // 更新任务数组
+
 	} else if c.Status == Exit {
 		// 提示Worker退出
 		*reply = Task{Tasktype: Exit}
@@ -107,56 +108,49 @@ func (c *Coordinator) AssignTask(args *NullArgs, reply *Task) error {
 	return nil
 }
 
-// Map任务完成
-func (c *Coordinator) MapTaskComplated(task *Task, reply *NullReply) error {
+func (c *Coordinator) TaskCompleted(task *Task, reply *NullReply) error {
 	Mu.Lock()
 	defer Mu.Unlock()
-
-	task.Taskstatus = MapTaskDone // 任务状态改为MapTaskDone
-
-	task.Tasktype = Reduce // 任务类型改为Reduce
-
-	c.createReduceTask(task) // 创建Reduce任务
-
-	c.Tasks[task.Id] = *task // 更新任务数组(此时任务由map转为reduce任务)
-
+	//log.Println("TaskComplated called, task.Id:", task.Id)
+	if c.Tasks[task.Id].Taskstatus == Completed || task.Tasktype != c.Status { // 如果是重复完成任务或者任务类型和当前阶段不匹配，则忽略
+		return nil
+	}
+	c.Tasks[task.Id].Taskstatus = Completed // 任务状态改为Completed
+	go c.processTaskResult(task)
 	return nil
 }
 
-// Reduce任务完成
-func (c *Coordinator) ReduceTaskComplated(task *Task, reply *NullReply) error {
+// 处理任务结果的函数
+func (c *Coordinator) processTaskResult(task *Task) {
 	Mu.Lock()
-	log.Println("ReduceTaskComplated called, task.Id:", task.Id)
-	task.Taskstatus = ReduceTaskDone // 任务状态改为ReduceTaskDone
-	c.Tasks[task.Id] = *task         // 更新任务数组
-	Mu.Unlock()
-	go func() {
-		Mu.Lock()
-		defer Mu.Unlock()
-		if c.CheckReduceTaskDone() {
-			c.Status = Exit // 状态改为Exit
+	defer Mu.Unlock()
+	//log.Println("processTaskResult called, task.Id:", task.Id)
+	switch task.Tasktype {
+	case Map:
+		// 首先将任务的中间结果存入 Intermediates 中
+		for idx, filename := range task.MiddleData {
+			c.Intermediates[idx] = append(c.Intermediates[idx], filename)
 		}
-	}()
-	return nil
+		//c.Intermediates[task.Id] = task.MiddleData
+		// 然后检查是否所有Map任务都完成
+		if c.CheckAllTaskDone() {
+			// 所有Map任务都完成，创建Reduce任务
+			c.createReduceTask()
+			c.Status = Reduce // 状态改为Reduce
+		}
+	case Reduce:
+		if c.CheckAllTaskDone() {
+			// 所有Reduce任务都完成，通知Worker退出
+			c.Status = Exit
+		}
+	}
 }
 
-// 获取队列长度
-func (c *Coordinator) GetQueueLen(args *NullArgs, reply *QueueLenReply) error {
-	Mu.Lock()
-	defer Mu.Unlock()
-	reply.Len = len(c.TasksQueue)
-	return nil
-}
-
-func (c *Coordinator) CheckReduceTaskDone() bool {
-	// 遍历任务数组，检查是否所有Reduce任务都完成
+func (c *Coordinator) CheckAllTaskDone() bool {
+	// 遍历任务数组，检查是否所有任务都完成
 	flag := true
 	for _, task := range c.Tasks {
-		log.Println(task)
-		if task.Tasktype == Map {
-			flag = false
-			break
-		} else if task.Tasktype == Reduce && task.Taskstatus != ReduceTaskDone {
+		if task.Taskstatus != Completed {
 			flag = false
 			break
 		}
@@ -166,7 +160,7 @@ func (c *Coordinator) CheckReduceTaskDone() bool {
 
 // start a thread that listens for RPCs from worker.go
 func (c *Coordinator) server() {
-	log.Println("RPC server started.")
+	//log.Println("RPC server started.")
 	rpc.Register(c)
 	rpc.HandleHTTP()
 	//l, e := net.Listen("tcp", ":1234")
@@ -180,6 +174,28 @@ func (c *Coordinator) server() {
 	go http.Serve(l, nil)
 }
 
+// 用来检查任务是否超时，这就可以做到心跳检测
+func (c *Coordinator) CheckTaskTimeout() {
+	for {
+		time.Sleep(time.Second * 5) // 5秒检测一次
+		Mu.Lock()
+		// 如果为退出状态，就直接放回
+		if c.Status == Exit {
+			Mu.Unlock()
+			return
+		}
+		for _, task := range c.Tasks {
+			if task.Taskstatus == TaskInProgress && time.Now().Sub(task.TaskStartTime) > time.Second*10 {
+				// 任务处理时间超过10s，认为超时（可能worker宕机了），重新分配任务
+				//log.Printf("Task %d timeout, reassigning task.\n", task.Id)
+				task.Taskstatus = TaskPending // 任务状态改为TaskPending
+				c.TasksQueue <- *task         // 重新将任务放入任务队列中
+			}
+		}
+		Mu.Unlock()
+	}
+}
+
 // main/mrcoordinator.go calls Done() periodically to find out
 // if the entire job has finished.
 func (c *Coordinator) Done() bool {
@@ -187,7 +203,7 @@ func (c *Coordinator) Done() bool {
 	Mu.Lock()
 	defer Mu.Unlock()
 	ret := c.Status == Exit // 状态码可能被多协程修改，需要加锁保护
-	log.Println("c.Status is", c.Status)
+	//log.Println("c.Status is", c.Status)
 	return ret
 }
 
@@ -195,24 +211,21 @@ func (c *Coordinator) Done() bool {
 // main/mrcoordinator.go calls this function.
 // nReduce is the number of reduce tasks to use.
 func MakeCoordinator(files []string, nReduce int) *Coordinator {
-	log.Println("MakeCoordinator called with files:", files, "and nReduce:", nReduce)
+	//log.Println("MakeCoordinator called with files:", files, "and nReduce:", nReduce)
 	numFiles = len(files)
 	c := Coordinator{
-		NReduce:          nReduce,
-		nMap:             nReduce,
-		WorkerId:         0,
-		Workers:          make(map[int]struct{}),
-		Tasks:            make(map[int]Task),
-		nTask:            0,
-		Status:           Wait,
-		heartBeatChannel: make(chan bool, 2*nReduce),
-		TasksQueue:       make(chan Task, max(nReduce, 2*numFiles)),
+		NReduce:       nReduce,
+		Tasks:         make(map[int]*Task),
+		nTask:         0,
+		Status:        Map,
+		Intermediates: make([][]string, nReduce),
+		TasksQueue:    make(chan Task, max(nReduce, 2*numFiles)),
 	}
 
-	log.Println("Coordinator  created:", c)
+	//log.Println("Coordinator  created:", c)
 
 	// 添加日志确认状态
-	log.Printf("Before creating map tasks: nReduce: %d\n", nReduce)
+	//log.Printf("Before creating map tasks: nReduce: %d\n", nReduce)
 
 	var TaskId int = 0
 	// 对文件进行切分
@@ -220,8 +233,9 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 
 	// 启动rpc服务
 	c.server()
-	c.Status = Active // 状态改为Active
-	log.Println("Coordinator status set to Active.")
+	//log.Println("Coordinator status set to Active.")
+
+	go c.CheckTaskTimeout() // 启动任务超时检测线程
 	// 会内存逃逸
 	return &c
 }
@@ -229,7 +243,8 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 // 已经将任务分割好了，内容存在了Input里
 func (c *Coordinator) createMapTask(files []string, TaskId int) {
 	// 添加日志确认
-	log.Printf("Creating map tasks for files: %v\n", files)
+	//log.Printf("Creating map tasks for files: %v\n", files)
+	// 遍历每个文件，获取文件大小，计算需要切分的文件数，创建Map任务
 	for _, file := range files {
 		fileinfo, err := os.Stat(file)
 		if err != nil {
@@ -267,7 +282,7 @@ func (c *Coordinator) createMapTask(files []string, TaskId int) {
 				fmt.Println("read error:", err)
 			}
 
-			task := Task{
+			task := &Task{
 				Id:         TaskId,
 				Input:      string(input[:n]),
 				NReduce:    c.NReduce,
@@ -276,16 +291,16 @@ func (c *Coordinator) createMapTask(files []string, TaskId int) {
 				MiddleData: nil,
 				Output:     "",
 			}
-			log.Printf("Creating task for file: %s, Task ID: %d\n", file, TaskId)
+			//log.Printf("Creating task for file: %s, Task ID: %d\n", file, TaskId)
 
 			Mu.Lock()
 			c.Tasks[TaskId] = task // 写入任务数组
 			c.nTask++
 			TaskId++
-			c.TasksQueue <- task // 写入Map任务队列
+			c.TasksQueue <- *task // 写入Map任务队列
 			Mu.Unlock()
 		}
-		log.Printf("Map tasks created, total tasks: %d\n", TaskId)
+		//log.Printf("Map tasks created, total tasks: %d\n", TaskId)
 	}
 }
 
@@ -306,12 +321,27 @@ func (c *Coordinator) createMapTask(files []string, TaskId int) {
 // 			heartBeatChannel: make(chan bool, 2*numReduce),
 // 			TasksQueue:       make(chan Task, max(numReduce, 2*numFiles)),
 // 		}
-// 		log.Println("Coordinator instance created:", instance)
+// 		//log.Println("Coordinator instance created:", instance)
 // 	})
 // 	return instance
 // }
 
-func (c *Coordinator) createReduceTask(task *Task) {
-	log.Println("createReduceTask start")
-	c.TasksQueue <- *task
+func (c *Coordinator) createReduceTask() {
+	//log.Println("createReduceTask start")
+	// 遍历 Intermediates，获取每个Map任务产生的Reduce个中间文件的信息
+	for idx, files := range c.Intermediates {
+		// 创建Reduce任务
+		task := &Task{
+			Id:         idx,
+			Input:      "",
+			NReduce:    c.NReduce,
+			Tasktype:   Reduce,
+			Taskstatus: TaskPending,
+			MiddleData: files,
+			Output:     "",
+		}
+		//log.Printf("Creating task for reduce, Task ID: %d\n", idx)
+		c.Tasks[idx] = task   // 写入任务数组
+		c.TasksQueue <- *task // 写入Reduce任务队列
+	}
 }

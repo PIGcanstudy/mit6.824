@@ -24,10 +24,6 @@ type ExampleReply struct {
 	Y int
 }
 
-type QueueLenReply struct {
-	Len int
-}
-
 type NullReply struct {
 }
 

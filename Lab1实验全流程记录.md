@@ -8,5 +8,30 @@
 
 - 解决方案：在协调器中记录mapper生成的中间结果，待所有map任务都完成后，再创建reduce任务，将等待逻辑直接改为睡眠
 
-## 阶段2
+# 阶段2
 
+## 问题：
+
+1. 过不了最基础的测试（测试脚本中的第一个）
+2. 出现了空指针问题
+3. crash测试和indexer测试失败
+
+
+
+## 解决方案及原因：
+
+1. 改变了阶段一的代码后，在一处设计处出现了问题，此代码在Coordinator.go文件的processTaskResult函数中，我在缓存中间结果的时候，直接把map生成的中间结果存在了一个任务列表中代码如下:
+```go
+c.Intermediates[task.Id] = task.MiddleData
+```
+这种操作会让一个Reducer处理本应该属于别的Reducer任务的中间结果，从而使得过不了测评,应该改为
+```go
+// 首先将任务的中间结果存入 Intermediates 中
+for idx, filename := range task.MiddleData {
+    c.Intermediates[idx] = append(c.Intermediates[idx], filename)
+}
+```
+这样就可以让对应Reducer只处理本该由它处理的中间结果。
+
+
+2. 原因：批量替换log的时候 把log.Fatal给注释了，导致程序在运行到这行的时候，会直接退出，导致空指针异常。
