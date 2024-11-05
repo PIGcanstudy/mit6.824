@@ -10,7 +10,6 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
-	"strconv"
 	"time"
 )
 
@@ -171,7 +170,10 @@ func mapper(task *Task, mapf func(string, string) []KeyValue) {
 
 	//log.Println("开始执行mapper")
 
-	taskName := strconv.Itoa(task.Id)
+	// 在这块 在阶段二中我写死了taskName为Id，但是应该做到为文件的名称才对
+
+	taskName := task.InputFileName
+
 	// 调用map函数处理任务
 	kva := mapf(taskName, task.Input)
 

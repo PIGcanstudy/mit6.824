@@ -48,6 +48,7 @@ const (
 type Task struct {
 	Id            int        // 用来标识一个任务
 	NReduce       int        // 用来存储Reduce任务的个数 （由于运行在不同进程使用全局变量行不通了，当然也可以使用PRC来传递此信息）
+	InputFileName string     // 输入文件的名称
 	Input         string     // 输入分割后的内容
 	Tasktype      TaskType   // 用来存储任务的类型
 	Taskstatus    TaskStatus // 用来存储任务的状态
@@ -283,13 +284,14 @@ func (c *Coordinator) createMapTask(files []string, TaskId int) {
 			}
 
 			task := &Task{
-				Id:         TaskId,
-				Input:      string(input[:n]),
-				NReduce:    c.NReduce,
-				Tasktype:   Map,
-				Taskstatus: TaskPending,
-				MiddleData: nil,
-				Output:     "",
+				Id:            TaskId,
+				InputFileName: file,
+				Input:         string(input[:n]),
+				NReduce:       c.NReduce,
+				Tasktype:      Map,
+				Taskstatus:    TaskPending,
+				MiddleData:    nil,
+				Output:        "",
 			}
 			//log.Printf("Creating task for file: %s, Task ID: %d\n", file, TaskId)
 
